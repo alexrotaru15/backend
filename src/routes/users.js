@@ -1,0 +1,157 @@
+const express = require("express");
+const router = express.Router();
+const { User, UserProfile, UserWordStats, UserMentions } = require("../models");
+const { Op } = require("sequelize");
+
+// Get paginated users sorted by message count
+router.get("/", async (req, res) => {
+	try {
+		const page = parseInt(req.query.page) || 1;
+		const limit = parseInt(req.query.limit) || 100;
+		const search = req.query.search || "";
+		const channelId = req.query.channelId || "mavro";
+		const offset = (page - 1) * limit;
+
+		// Build where clause for messages > 0 based on channel
+		const messageField =
+			channelId === "272573477" ? "doc_messages" : "mavro_messages";
+
+		const baseWhereClause = {
+			[messageField]: {
+				[Op.and]: [{ [Op.not]: null }, { [Op.gt]: 0 }],
+			},
+		};
+
+		// Add search condition if search term exists
+		const searchWhereClause = search
+			? {
+					[Op.or]: [
+						{
+							displayName: {
+								[Op.iLike]: `%${search}%`,
+							},
+						},
+						{
+							name: {
+								[Op.iLike]: `%${search}%`,
+							},
+						},
+					],
+			  }
+			: {};
+
+		// Combine base and search conditions
+		const whereClause = {
+			...baseWhereClause,
+			...(search ? searchWhereClause : {}),
+		};
+
+		// First get all user IDs ordered by message count to calculate global ranks
+		const allUserRanks = await User.findAll({
+			where: baseWhereClause,
+			attributes: ["id"],
+			order: [
+				[messageField, "DESC"],
+				["id", "ASC"],
+			],
+		});
+
+		// Create a map of user ID to global rank
+		const userRankMap = new Map(
+			allUserRanks.map((user, index) => [user.id, index + 1])
+		);
+
+		// Get total count for pagination
+		const totalCount = await User.count({
+			where: whereClause,
+		});
+
+		const users = await User.findAll({
+			where: whereClause,
+			order: [
+				[messageField, "DESC"],
+				["id", "ASC"],
+			],
+			limit: limit,
+			offset: offset,
+			attributes: [
+				"id",
+				"displayName",
+				"name",
+				"bio",
+				"logo",
+				"mavro_messages",
+				"mavro_messages_percentage",
+				"doc_messages",
+				"doc_messages_percentage",
+			],
+			include: [
+				{
+					model: UserProfile,
+					attributes: [
+						"profile",
+						"personality_traits",
+						"interests",
+						"sports_team",
+						"political_preference",
+						"favorite_celebrities",
+						"communication_style",
+						"additional_info",
+						"last_updated",
+					],
+					required: false,
+					where: {
+						channelId: channelId,
+					},
+				},
+				{
+					model: UserWordStats,
+					attributes: ["word", "count", "rank"],
+					required: false,
+					where: {
+						channelId: channelId,
+						rank: {
+							[Op.lte]: 10,
+						},
+					},
+					order: [["rank", "ASC"]],
+				},
+				{
+					model: UserMentions,
+					as: "Mentions",
+					attributes: ["mentionedUser", "count", "rank"],
+					required: false,
+					where: {
+						channelId: channelId,
+						rank: {
+							[Op.lte]: 5,
+						},
+					},
+					order: [["rank", "ASC"]],
+				},
+			],
+		});
+
+		// Add global rank to each user
+		const usersWithRank = users.map((user) => {
+			const plainUser = user.get({ plain: true });
+			return {
+				...plainUser,
+				globalRank: userRankMap.get(user.id),
+			};
+		});
+
+		res.json({
+			users: usersWithRank,
+			page,
+			limit,
+			total: totalCount,
+			hasMore: offset + users.length < totalCount,
+		});
+	} catch (error) {
+		console.error("Error in users route:", error);
+		res.status(500).json({ error: "Internal server error" });
+	}
+});
+
+module.exports = router;
